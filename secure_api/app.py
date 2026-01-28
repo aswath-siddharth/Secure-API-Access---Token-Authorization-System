@@ -6,30 +6,87 @@ import base64
 import hmac
 import hashlib
 import time
-
 import os
 from functools import wraps
+from cryptography.fernet import Fernet
 
 otp_store = {}  # {user_id: (otp, expiry_time)}
 SECRET_KEY = os.environ.get('SECRET_KEY', 'supersecretkey').encode()
+
+# Generate a key for encryption (In production, load this from environment!)
+# For this demo, we ensure it's consistent if restart happens by checking for a file or env, 
+# but simply regenerating for now as per "Demonstrate secure key generation"
+# A real system would persist this key.
+FERNET_KEY = Fernet.generate_key() 
+cipher_suite = Fernet(FERNET_KEY)
+
+def get_db():
+    return sqlite3.connect("users.db")
 def generate_token(user_id, role):
-    payload = f"{user_id}|{role}|{int(time.time())}|{int(time.time())+3600}"
-    encoded = base64.b64encode(payload.encode())
-    signature = hmac.new(SECRET_KEY, encoded, hashlib.sha256).hexdigest()
-    return encoded.decode(), signature
+    # 1. Create the payload
+    # Add randomness/salt to ensuring unique tokens even for same user/time? 
+    # Current: user|role|issue|expire. Good enough for demo.
+    expiry_time = int(time.time()) + 3600
+    payload = f"{user_id}|{role}|{int(time.time())}|{expiry_time}"
+    
+    # 2. Encode & Sign (Integrity)
+    encoded_token = base64.b64encode(payload.encode()).decode() # The "Token" String
+    signature = hmac.new(SECRET_KEY, encoded_token.encode(), hashlib.sha256).hexdigest()
+    
+    # 3. Encrypt & Store (Confidentiality & Revocation capability)
+    # We store the 'encoded_token' string, encrypted.
+    encrypted_token = cipher_suite.encrypt(encoded_token.encode())
+    
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("INSERT INTO tokens (user_id, encrypted_token, expires_at) VALUES (?, ?, ?)", 
+                (user_id, encrypted_token, expiry_time))
+    conn.commit()
+    conn.close()
+
+    return encoded_token, signature
 
 def verify_token(token, signature):
+    # 1. Integrity Check (HMAC)
     encoded = token.encode()
     expected_sig = hmac.new(SECRET_KEY, encoded, hashlib.sha256).hexdigest()
 
     if not hmac.compare_digest(expected_sig, signature):
-        return None
+        return None # Tampered
 
-    decoded = base64.b64decode(encoded).decode()
-    user_id, role, issued, expiry = decoded.split("|")
+    # 2. Decode & Expiry Check (Stateless)
+    try:
+        decoded = base64.b64decode(encoded).decode()
+        user_id, role, issued, expiry = decoded.split("|")
+        
+        if int(time.time()) > int(expiry):
+            return None # Expired
+            
+    except Exception:
+        return None # Malformed
 
-    if int(time.time()) > int(expiry):
-        return None
+    # 3. Authenticity & Revocation Check (Stateful - DB)
+    # We must find this token in the DB, encrypted.
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT encrypted_token FROM tokens WHERE user_id = ?", (user_id,))
+    stored_tokens = cur.fetchall()
+    
+    token_is_valid_in_db = False
+    for (enc_tok,) in stored_tokens:
+        try:
+            # Decrypt token from DB
+            decrypted_db_token = cipher_suite.decrypt(enc_tok).decode()
+            if decrypted_db_token == token:
+                token_is_valid_in_db = True
+                break
+        except Exception as e:
+            continue # Skip invalid/old keys if any
+            
+    conn.close()
+    
+    if not token_is_valid_in_db:
+        return None # Revoked or Fake
 
     return role
 
@@ -43,12 +100,23 @@ def get_db():
 def init_db():
     conn = get_db()
     cur = conn.cursor()
+    # Users Table
     cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE,
             password BLOB,
             role TEXT
+        )
+    """)
+    # Tokens Table for Stateful Validation (Revocation & Security)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            encrypted_token BLOB,
+            expires_at REAL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
         )
     """)
     conn.commit()
@@ -199,11 +267,67 @@ def role_required(required_role):
 def dashboard(role):
     return jsonify({"message": f"Welcome strictly authenticated user! Your role is {role}"})
 
+@app.route('/developer_resource', methods=['GET'])
+@token_required
+@role_required("DEVELOPER")
+def developer_panel(role):
+    return jsonify({"message": "Welcome Developer! Access granted to API docs and sandboxes."})
+
+@app.route('/consumer_resource', methods=['GET'])
+@token_required
+@role_required("CONSUMER")
+def consumer_dashboard(role):
+    return jsonify({"message": "Welcome Consumer! Here is your usage data."})
+
 @app.route('/admin', methods=['GET'])
 @token_required
 @role_required("ADMIN")
 def admin_panel(role):
     return jsonify({"message": "Welcome to the Admin Panel! You have full control."})
+
+@app.route('/logout', methods=['POST'])
+def logout():
+    # User sends token to logout
+    token = request.headers.get('Authorization')
+    if not token:
+        return jsonify({"message": "Token missing"}), 400
+        
+    # We find and delete this token from DB
+    # Since we store encrypted tokens, we have to find which one it is.
+    # Optimization: In real world, we might store a hash of the token for lookup, 
+    # but here we iterate for demonstration of "Decryption" requirement.
+    
+    # Needs user_id to narrow down search or search all? 
+    # Let's decode token to get user_id first (insecure decode is fine for lookup logic)
+    try:
+        decoded_bytes = base64.b64decode(token)
+        decoded_str = decoded_bytes.decode()
+        user_id = decoded_str.split("|")[0]
+    except:
+        return jsonify({"message": "Invalid token format"}), 400
+
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("SELECT id, encrypted_token FROM tokens WHERE user_id = ?", (user_id,))
+    rows = cur.fetchall()
+    
+    token_id_to_delete = None
+    for row_id, enc_tok in rows:
+        try:
+            if cipher_suite.decrypt(enc_tok).decode() == token:
+                token_id_to_delete = row_id
+                break
+        except:
+            continue
+            
+    if token_id_to_delete:
+        cur.execute("DELETE FROM tokens WHERE id = ?", (token_id_to_delete,))
+        conn.commit()
+        conn.close()
+        return jsonify({"message": "Logged out successfully. Token revoked."})
+    else:
+        conn.close()
+        return jsonify({"message": "Token not found or already revoked."}), 400
 
 if __name__ == '__main__':
     app.run(debug=True)
