@@ -13,10 +13,7 @@ from cryptography.fernet import Fernet
 otp_store = {}  # {user_id: (otp, expiry_time)}
 SECRET_KEY = os.environ.get('SECRET_KEY', 'supersecretkey').encode()
 
-# Generate a key for encryption (In production, load this from environment!)
-# For this demo, we ensure it's consistent if restart happens by checking for a file or env, 
-# but simply regenerating for now as per "Demonstrate secure key generation"
-# A real system would persist this key.
+
 FERNET_KEY = Fernet.generate_key() 
 cipher_suite = Fernet(FERNET_KEY)
 
@@ -26,7 +23,7 @@ def generate_token(user_id, role):
     # 1. Create the payload
     # Add randomness/salt to ensuring unique tokens even for same user/time? 
     # Current: user|role|issue|expire. Good enough for demo.
-    expiry_time = int(time.time()) + 3600
+    expiry_time = int(time.time()) + 3600000
     payload = f"{user_id}|{role}|{int(time.time())}|{expiry_time}"
     
     # 2. Encode & Sign (Integrity)
@@ -255,11 +252,18 @@ def role_required(required_role):
     def decorator(f):
         @wraps(f)
         def decorated_function(current_user_role, *args, **kwargs):
+            # Admin has access to everything
+            if current_user_role == "ADMIN":
+                return f(current_user_role, *args, **kwargs)
+
+            # Normal role check
             if current_user_role != required_role:
-                 return jsonify({'message': 'Permission Denied: You do not have access!'}), 403
+                return jsonify({'message': 'Permission Denied: You do not have access!'}), 403
+            
             return f(current_user_role, *args, **kwargs)
         return decorated_function
     return decorator
+
 
 # ---------- Protected Routes ----------
 @app.route('/dashboard', methods=['GET'])
@@ -267,13 +271,13 @@ def role_required(required_role):
 def dashboard(role):
     return jsonify({"message": f"Welcome strictly authenticated user! Your role is {role}"})
 
-@app.route('/developer_resource', methods=['GET'])
+@app.route('/developer', methods=['GET'])
 @token_required
 @role_required("DEVELOPER")
 def developer_panel(role):
     return jsonify({"message": "Welcome Developer! Access granted to API docs and sandboxes."})
 
-@app.route('/consumer_resource', methods=['GET'])
+@app.route('/consumer', methods=['GET'])
 @token_required
 @role_required("CONSUMER")
 def consumer_dashboard(role):
@@ -294,8 +298,7 @@ def logout():
         
     # We find and delete this token from DB
     # Since we store encrypted tokens, we have to find which one it is.
-    # Optimization: In real world, we might store a hash of the token for lookup, 
-    # but here we iterate for demonstration of "Decryption" requirement.
+
     
     # Needs user_id to narrow down search or search all? 
     # Let's decode token to get user_id first (insecure decode is fine for lookup logic)
